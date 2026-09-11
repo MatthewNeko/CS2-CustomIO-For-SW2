@@ -14,7 +14,7 @@ using SwiftlyS2.Shared.SchemaDefinitions;
 
 namespace CustomIO;
 
-[PluginMetadata(Id = "CS2 CustomIO For SW2", Version = "1.6", Name = "CustomIO SW2", Author = "DarkerZ & LynchMus", Description = "Fixes missing keyvalues from CSS/CS:GO", Website = "https://github.com/himenekocn/CS2-CustomIO-For-SW2")]
+[PluginMetadata(Id = "CS2 CustomIO For SW2", Version = "1.7", Name = "CustomIO SW2", Author = "DarkerZ & LynchMus", Description = "Fixes missing keyvalues from CSS/CS:GO", Website = "https://github.com/himenekocn/CS2-CustomIO-For-SW2")]
 public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
 {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -25,20 +25,52 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
     private delegate void CBaseEntity_SetGravityScale_Delegate(nint a1, float a2);
     private static IUnmanagedFunction<CBaseEntity_SetGravityScale_Delegate>? CBaseEntity_SetGravityScale_Func;
 
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate void ProcessMovement_Delegate(nint a1, nint a2);
+    private static IUnmanagedFunction<ProcessMovement_Delegate>? ProcessMovement_Func;
+    private Guid? ProcessMovement_HookId;
+
     private Guid? SpawnEvent_HookId;
 
     private IConVar<bool>? sw_iodebug;
 
     private ConcurrentDictionary<int, float> pflSpeedMod = [];
 
+    // 断线时玩家对象可能已失效(GetPlayer 返回 null),按 Slot 记录 UserID 以便兜底移除速度修正
+    private readonly ConcurrentDictionary<int, int> _slotUserIds = [];
+
     public override void Load(bool hotReload)
     {
         sw_iodebug = Core.ConVar.CreateOrFind("sw_iodebug", "Enable IO Debug", false);
 
-        CEntityIdentity_SetEntityName_Func = Core.Memory.GetUnmanagedFunctionByAddress<CEntityIdentity_SetEntityName_Delegate>(Core.GameData.GetSignature("CEntityInstance::SetEntityName"));
-        CBaseEntity_SetGravityScale_Func = Core.Memory.GetUnmanagedFunctionByAddress<CBaseEntity_SetGravityScale_Delegate>(Core.GameData.GetSignature("CBaseEntity::SetGravityScale"));
-        Core.GameHooks.Movement.ProcessMovement.Pre += OnProcessMovementPre;
-        Core.GameHooks.Movement.ProcessMovement.Post += OnProcessMovementPost;
+        var addr = Core.GameData.GetSignature("CEntityInstance::SetEntityName");
+
+        if (addr == IntPtr.Zero)
+        {
+            Core.Logger.LogError("CEntityInstance::SetEntityName not found");
+            return;
+        }
+
+        CEntityIdentity_SetEntityName_Func = Core.Memory.GetUnmanagedFunctionByAddress<CEntityIdentity_SetEntityName_Delegate>(addr);
+
+        addr = Core.GameData.GetSignature("CBaseEntity::SetGravityScale");
+
+        if (addr == IntPtr.Zero)
+        {
+            Core.Logger.LogError("CBaseEntity::SetGravityScale not found");
+            return;
+        }
+
+        CBaseEntity_SetGravityScale_Func = Core.Memory.GetUnmanagedFunctionByAddress<CBaseEntity_SetGravityScale_Delegate>(addr);
+        addr = Core.GameData.GetSignature("ProcessMovement");
+
+        if (addr == IntPtr.Zero)
+        {
+            Core.Logger.LogError("ProcessMovement not found");
+            return;
+        }
+        ProcessMovement_Func = Core.Memory.GetUnmanagedFunctionByAddress<ProcessMovement_Delegate>(addr);
+        ProcessMovement_HookId = ProcessMovement_Func.AddHook(ProcessMovementHook);
 
         Core.GameHooks.Entities.AcceptInput.Pre += OnAcceptInputPre;
         Core.Event.OnClientPutInServer += OnClientPutInServer;
@@ -47,12 +79,14 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
         SpawnEvent_HookId = Core.GameEvent.HookPost<EventPlayerSpawn>(OnPlayerSpawn);
 
         pflSpeedMod.Clear();
+        _slotUserIds.Clear();
     }
 
     public override void Unload()
     {
-        Core.GameHooks.Movement.ProcessMovement.Pre -= OnProcessMovementPre;
-        Core.GameHooks.Movement.ProcessMovement.Post -= OnProcessMovementPost;
+        if (ProcessMovement_HookId != null)
+            ProcessMovement_Func?.RemoveHook(ProcessMovement_HookId.Value);
+
         Core.GameHooks.Entities.AcceptInput.Pre -= OnAcceptInputPre;
         Core.Event.OnClientPutInServer -= OnClientPutInServer;
         Core.Event.OnClientDisconnected -= OnClientDisconnected;
@@ -61,51 +95,64 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
             Core.GameEvent.Unhook(SpawnEvent_HookId.Value);
 
         pflSpeedMod.Clear();
+        _slotUserIds.Clear();
     }
 
-    private float _storedFrameTime;
-
-    private void OnProcessMovementPre(ref ProcessMovementMovementPreContext ctx)
+    private ProcessMovement_Delegate ProcessMovementHook(Func<ProcessMovement_Delegate> func)
     {
-        var player = ctx.Params.Player;
-        if (player == null || !player.IsValid)
-            return;
+        return (a1, a2) =>
+        {
+            var ms = Helper.AsSchema<CCSPlayer_MovementServices>(a1);
+            if (!ms.IsValid)
+            {
+                func()(a1, a2);
+                return;
+            }
 
-        if (!pflSpeedMod.TryGetValue(player.UserID, out var speedMod))
-            return;
+            var pawn = ms.Pawn;
+            if (pawn == null || !pawn.IsValid)
+            {
+                func()(a1, a2);
+                return;
+            }
 
-        if (speedMod == 1.0f)
-            return;
+            var player = Core.PlayerManager.GetPlayerFromPawn(pawn);
+            if (player == null || !player.IsValid)
+            {
+                func()(a1, a2);
+                return;
+            }
 
-        _storedFrameTime = Core.Engine.GlobalVars.FrameTime;
-        Core.Engine.GlobalVars.FrameTime *= speedMod;
-    }
+            if (!pflSpeedMod.TryGetValue(player.UserID, out var speedMod))
+                pflSpeedMod[player.UserID] = speedMod = 1.0f;
 
-    private void OnProcessMovementPost(ref ProcessMovementMovementPostContext ctx)
-    {
-        var player = ctx.Params.Player;
-        if (player == null || !player.IsValid)
-            return;
+            if (speedMod == 1.0f)
+            {
+                func()(a1, a2);
+                return;
+            }
 
-        if (!pflSpeedMod.TryGetValue(player.UserID, out var speedMod))
-            return;
-
-        if (speedMod == 1.0f)
-            return;
-
-        Core.Engine.GlobalVars.FrameTime = _storedFrameTime;
+            float flStoreFrametime = Core.Engine.GlobalVars.FrameTime;
+            Core.Engine.GlobalVars.FrameTime *= speedMod;
+            func()(a1, a2);
+            Core.Engine.GlobalVars.FrameTime = flStoreFrametime;
+        };
     }
 
     private void OnClientDisconnected(IOnClientDisconnectedEvent @event)
     {
         var slot = @event.PlayerId;
         var player = Core.PlayerManager.GetPlayer(slot);
-        if (player == null || !player.Controller.IsValid)
+        if (player != null && player.Controller.IsValid)
         {
-            return;
+            pflSpeedMod.TryRemove(player.UserID, out _);
+        }
+        else if (_slotUserIds.TryGetValue(slot, out var userId))
+        {
+            pflSpeedMod.TryRemove(userId, out _);
         }
 
-        pflSpeedMod.TryRemove(player.UserID, out _);
+        _slotUserIds.TryRemove(slot, out _);
     }
 
     private void OnClientPutInServer(IOnClientPutInServerEvent @event)
@@ -117,6 +164,7 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
             return;
         }
 
+        _slotUserIds[slot] = player.UserID;
         pflSpeedMod.TryAdd(player.UserID, 1.0f);
     }
 
@@ -128,6 +176,7 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
             return HookResult.Continue;
         }
 
+        _slotUserIds[player.Slot] = player.UserID;
         pflSpeedMod[player.UserID] = 1.0f;
         return HookResult.Continue;
     }
