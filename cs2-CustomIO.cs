@@ -39,6 +39,8 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
     // 断线时玩家对象可能已失效(GetPlayer 返回 null),按 Slot 记录 UserID 以便兜底移除速度修正
     private readonly ConcurrentDictionary<int, int> _slotUserIds = [];
 
+    private static CCSPlayer_MovementServices _MovementServicesInstance = Helper.AsSchema<CCSPlayer_MovementServices>(0);
+
     public override void Load(bool hotReload)
     {
         sw_iodebug = Core.ConVar.CreateOrFind("sw_iodebug", "Enable IO Debug", false);
@@ -102,14 +104,14 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
     {
         return (a1, a2) =>
         {
-            var ms = Helper.AsSchema<CCSPlayer_MovementServices>(a1);
-            if (!ms.IsValid)
+            _MovementServicesInstance.DangerouslySetAddress(a1);
+            if (!_MovementServicesInstance.IsValid)
             {
                 func()(a1, a2);
                 return;
             }
 
-            var pawn = ms.Pawn;
+            var pawn = _MovementServicesInstance.Pawn;
             if (pawn == null || !pawn.IsValid)
             {
                 func()(a1, a2);
