@@ -64,11 +64,11 @@ public partial class CustomIO(ISwiftlyCore core) : BasePlugin(core)
         }
 
         CBaseEntity_SetGravityScale_Func = Core.Memory.GetUnmanagedFunctionByAddress<CBaseEntity_SetGravityScale_Delegate>(addr);
-        addr = Core.GameData.GetSignature("ProcessMovement");
+        addr = Core.GameData.GetSignature("CCSPlayer_MovementServices::ProcessMovement");
 
         if (addr == IntPtr.Zero)
         {
-            Core.Logger.LogError("ProcessMovement not found");
+            Core.Logger.LogError("CCSPlayer_MovementServices::ProcessMovement not found");
             return;
         }
         ProcessMovement_Func = Core.Memory.GetUnmanagedFunctionByAddress<ProcessMovement_Delegate>(addr);
